@@ -1,21 +1,18 @@
 /*
  ============================================================================
  Name        : hev-main.c
- Author      : hev <r@hev.cc>
- Copyright   : Copyright (c) 2019 - 2023 hev
- Description : Main
+ Author      : hev <r@hev.cc> - Enhanced with Multi-threading
+ Copyright   : Copyright (c) 2019 - 2025 hev
+ Description : Main - Multi-threaded Version
  ============================================================================
  */
 
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <lwip/init.h>
-
-#include <hev-task.h>
-#include <hev-task-system.h>
-#include <hev-socks5-misc.h>
 
 #include "hev-utils.h"
 #include "hev-config.h"
@@ -65,15 +62,9 @@ hev_socks5_tunnel_main_inner (int tun_fd)
     if (pid_file)
         run_as_daemon (pid_file);
 
-    res = hev_task_system_init ();
-    if (res < 0)
-        return -4;
-
-    lwip_init ();
-
     res = hev_socks5_tunnel_init (tun_fd);
     if (res < 0)
-        return -5;
+        return -4;
 
     hev_socks5_tunnel_run ();
 
@@ -81,7 +72,6 @@ hev_socks5_tunnel_main_inner (int tun_fd)
     hev_socks5_logger_fini ();
     hev_logger_fini ();
     hev_config_fini ();
-    hev_task_system_fini ();
 
     return 0;
 }
@@ -124,8 +114,8 @@ static void
 show_help (const char *self_path)
 {
     printf ("%s CONFIG_PATH\n", self_path);
-    printf ("Version: %u.%u.%u %s\n", MAJOR_VERSION, MINOR_VERSION,
-            MICRO_VERSION, COMMIT_ID);
+    printf ("Version: %u.%u.%u %s (Multi-threaded)\n", MAJOR_VERSION,
+            MINOR_VERSION, MICRO_VERSION, COMMIT_ID);
 }
 
 static void
@@ -145,6 +135,7 @@ main (int argc, char *argv[])
     }
 
     signal (SIGINT, sigint_handler);
+    signal (SIGTERM, sigint_handler);
 
     res = hev_socks5_tunnel_main (argv[1], -1);
     if (res < 0)

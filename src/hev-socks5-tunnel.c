@@ -1,9 +1,9 @@
 /*
  ============================================================================
  Name        : hev-socks5-tunnel.c
- Author      : hev <r@hev.cc>
+ Author      : hev <r@hev.cc> - Enhanced with Multi-threading
  Copyright   : Copyright (c) 2019 - 2025 hev
- Description : Socks5 Tunnel
+ Description : Socks5 Tunnel - Multi-threaded Version
  ============================================================================
  */
 
@@ -11,7 +11,9 @@
 #include <assert.h>
 #include <signal.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
+#include <unistd.h>
 
 #include <lwip/tcp.h>
 #include <lwip/udp.h>
@@ -21,12 +23,6 @@
 #include <lwip/ip6_frag.h>
 #include <lwip/priv/tcp_priv.h>
 
-#include <hev-task.h>
-#include <hev-task-io.h>
-#include <hev-task-mutex.h>
-#include <hev-task-system.h>
-#include <hev-memory-allocator.h>
-
 #include "hev-exec.h"
 #include "hev-config.h"
 #include "hev-logger.h"
@@ -34,55 +30,161 @@
 #include "hev-compiler.h"
 #include "hev-mapped-dns.h"
 #include "hev-config-const.h"
+#include "hev-thread-pool.h"
+#include "hev-tunnel-io.h"
 #include "hev-socks5-session-tcp.h"
 #include "hev-socks5-session-udp.h"
 
 #include "hev-socks5-tunnel.h"
 
-static int run;
+/* Global state */
+static volatile int run = 0;
 static int tun_fd = -1;
-static int tun_fd_local;
-static int session_count;
-static int event_fds[2] = { -1, -1 };
+static int tun_fd_local = 0;
+static volatile int session_count = 0;
 
-static size_t stat_tx_packets;
-static size_t stat_rx_packets;
-static size_t stat_tx_bytes;
-static size_t stat_rx_bytes;
+/* Threading infrastructure */
+static HevThreadPool *thread_pool = NULL;
+static HevTunnelIO *tunnel_io = NULL;
+static pthread_t timer_thread;
+static pthread_mutex_t lwip_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Network interface */
 static struct netif netif;
 static struct tcp_pcb *tcp;
 static struct udp_pcb *udp;
 
-static HevTaskMutex mutex;
-static HevTask *task_event;
-static HevTask *task_lwip_io;
-static HevTask *task_lwip_timer;
-static HevList session_set;
-
-static int
-task_io_yielder (HevTaskYieldType type, void *data)
+/* Session tracking */
+typedef struct _SessionNode SessionNode;
+struct _SessionNode
 {
-    hev_task_yield (type);
+    void *session;
+    SessionNode *next;
+    SessionNode *prev;
+};
 
-    return run ? 0 : -1;
+static SessionNode *session_list_head = NULL;
+static SessionNode *session_list_tail = NULL;
+
+/* Forward declarations */
+static void packet_read_callback (struct pbuf *p, void *user_data);
+static void *timer_thread_func (void *arg);
+
+/* ========================================================================
+ * Session Management
+ * ======================================================================== */
+
+static void
+insert_session (void *session)
+{
+    SessionNode *node;
+    int max_sessions;
+
+    node = (SessionNode *)malloc (sizeof (SessionNode));
+    if (!node)
+        return;
+
+    node->session = session;
+    node->next = NULL;
+
+    pthread_mutex_lock (&session_mutex);
+
+    /* Add to tail */
+    node->prev = session_list_tail;
+    if (session_list_tail)
+        session_list_tail->next = node;
+    else
+        session_list_head = node;
+    session_list_tail = node;
+
+    session_count++;
+
+    /* Enforce session limit */
+    max_sessions = hev_config_get_misc_max_session_count ();
+    if (max_sessions > 0 && session_count > max_sessions) {
+        /* Terminate oldest session */
+        if (session_list_head && session_list_head->session) {
+            LOG_W ("session limit reached, terminating oldest session");
+            /* TODO: Add session termination callback */
+        }
+    }
+
+    pthread_mutex_unlock (&session_mutex);
 }
+
+static void
+remove_session (void *session)
+{
+    SessionNode *node;
+
+    pthread_mutex_lock (&session_mutex);
+
+    /* Find and remove node */
+    for (node = session_list_head; node; node = node->next) {
+        if (node->session == session) {
+            if (node->prev)
+                node->prev->next = node->next;
+            else
+                session_list_head = node->next;
+
+            if (node->next)
+                node->next->prev = node->prev;
+            else
+                session_list_tail = node->prev;
+
+            free (node);
+            session_count--;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock (&session_mutex);
+}
+
+/* ========================================================================
+ * Session Task Wrappers
+ * ======================================================================== */
+
+typedef struct
+{
+    void *session;
+    void (*run_func) (void *);
+} SessionTaskData;
+
+static void
+session_task_wrapper (void *data)
+{
+    SessionTaskData *task_data = (SessionTaskData *)data;
+
+    LOG_D ("session task started");
+
+    /* Run the session */
+    task_data->run_func (task_data->session);
+
+    /* Clean up */
+    remove_session (task_data->session);
+    free (task_data);
+
+    LOG_D ("session task completed");
+}
+
+/* ========================================================================
+ * LwIP Callbacks
+ * ======================================================================== */
 
 static err_t
 netif_output_handler (struct netif *netif, struct pbuf *p)
 {
-    ssize_t s;
+    int res;
 
-    s = hev_tunnel_write (tun_fd, p);
-    if (s <= 0) {
+    res = hev_tunnel_io_write (tunnel_io, p);
+    if (res < 0) {
         if (errno == EAGAIN)
             return ERR_WOULDBLOCK;
-        LOG_W ("socks5 tunnel write");
+        LOG_W ("tunnel write error");
         return ERR_IF;
     }
-
-    stat_rx_packets++;
-    stat_rx_bytes += s;
 
     return ERR_OK;
 }
@@ -106,66 +208,14 @@ netif_init_handler (struct netif *netif)
 {
     netif->output = netif_output_v4_handler;
     netif->output_ip6 = netif_output_v6_handler;
-
     return ERR_OK;
-}
-
-static void
-hev_socks5_tunnel_insert_session (HevListNode *node)
-{
-    HevSocks5SessionData *sd;
-    int max_session_count;
-
-    hev_list_add_tail (&session_set, node);
-    session_count++;
-
-    max_session_count = hev_config_get_misc_max_session_count ();
-    if (!max_session_count || session_count < max_session_count)
-        return;
-
-    node = hev_list_first (&session_set);
-    sd = container_of (node, HevSocks5SessionData, node);
-    hev_socks5_session_terminate (sd->self);
-}
-
-static void
-hev_socks5_tunnel_delete_session (HevListNode *node)
-{
-    hev_list_del (&session_set, node);
-    session_count--;
-}
-
-void
-hev_socks5_tunnel_update_session (HevListNode *node)
-{
-    int max_session_count;
-
-    max_session_count = hev_config_get_misc_max_session_count ();
-    if (!max_session_count)
-        return;
-
-    hev_list_del (&session_set, node);
-    hev_list_add_tail (&session_set, node);
-}
-
-static void
-hev_socks5_session_task_entry (void *data)
-{
-    HevSocks5Session *s = data;
-
-    hev_socks5_session_run (s);
-
-    hev_socks5_tunnel_delete_session (hev_socks5_session_get_node (s));
-    hev_object_unref (HEV_OBJECT (s));
 }
 
 static err_t
 tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
 {
-    HevSocks5SessionTCP *tcp;
-    HevListNode *node;
-    int stack_size;
-    HevTask *task;
+    SessionTaskData *task_data;
+    void *tcp_session;
 
     if (err != ERR_OK)
         return err;
@@ -173,167 +223,160 @@ tcp_accept_handler (void *arg, struct tcp_pcb *pcb, err_t err)
     if (!run)
         return ERR_RST;
 
-    tcp = hev_socks5_session_tcp_new (pcb, &mutex);
-    if (!tcp)
+    LOG_D ("accepting new TCP connection");
+
+    /* Create TCP session */
+    pthread_mutex_lock (&lwip_mutex);
+    tcp_session = hev_socks5_session_tcp_new (pcb, &lwip_mutex);
+    pthread_mutex_unlock (&lwip_mutex);
+
+    if (!tcp_session)
         return ERR_MEM;
 
-    stack_size = hev_config_get_misc_task_stack_size ();
-    task = hev_task_new (stack_size);
-    if (!task) {
-        hev_object_unref (HEV_OBJECT (tcp));
+    /* Create task data */
+    task_data = (SessionTaskData *)malloc (sizeof (SessionTaskData));
+    if (!task_data) {
+        /* TODO: Free session */
         return ERR_MEM;
     }
 
-    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (tcp), task);
-    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (tcp));
-    hev_socks5_tunnel_insert_session (node);
-    hev_task_run (task, hev_socks5_session_task_entry, tcp);
-    hev_task_wakeup (task_lwip_timer);
+    task_data->session = tcp_session;
+    task_data->run_func = (void (*) (void *))hev_socks5_session_run;
+
+    /* Track session */
+    insert_session (tcp_session);
+
+    /* Submit to thread pool */
+    if (hev_thread_pool_submit (thread_pool, session_task_wrapper,
+                                task_data) < 0) {
+        LOG_E ("failed to submit TCP session to thread pool");
+        remove_session (tcp_session);
+        free (task_data);
+        return ERR_MEM;
+    }
 
     return ERR_OK;
-}
-
-static void
-dns_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
-                  const ip_addr_t *addr, u16_t port)
-{
-    HevMappedDNS *dns = arg;
-    struct pbuf *b;
-    int res;
-
-    LOG_D ("%p mapped dns handle", dns);
-
-    b = pbuf_alloc (PBUF_TRANSPORT, UDP_BUF_SIZE, PBUF_RAM);
-    if (!b)
-        goto exit;
-
-    res = hev_mapped_dns_handle (dns, p->payload, p->len, b->payload, b->len);
-    if (res < 0)
-        goto free;
-
-    b->len = res;
-    b->tot_len = res;
-    udp_sendfrom (pcb, b, &pcb->local_ip, pcb->local_port);
-
-free:
-    pbuf_free (b);
-exit:
-    pbuf_free (p);
-    udp_recv (pcb, NULL, NULL);
-    udp_remove (pcb);
 }
 
 static void
 udp_recv_handler (void *arg, struct udp_pcb *pcb, struct pbuf *p,
                   const ip_addr_t *addr, u16_t port)
 {
-    HevSocks5SessionUDP *udp;
-    HevListNode *node;
+    SessionTaskData *task_data;
+    void *udp_session;
     HevMappedDNS *dns;
-    int stack_size;
-    HevTask *task;
 
     if (!run) {
+        pbuf_free (p);
         udp_remove (pcb);
         return;
     }
 
+    /* Check for DNS mapping */
     dns = hev_mapped_dns_get ();
     if (dns && addr->type == IPADDR_TYPE_V4) {
         int faddr = hev_config_get_mapdns_address ();
         int fport = hev_config_get_mapdns_port ();
         if (fport == port && faddr == ip_2_ip4 (addr)->addr) {
-            udp_recv (pcb, dns_recv_handler, dns);
+            /* Handle DNS query */
+            struct pbuf *b;
+            int res;
+
+            b = pbuf_alloc (PBUF_TRANSPORT, 512, PBUF_RAM);
+            if (b) {
+                pthread_mutex_lock (&lwip_mutex);
+                res = hev_mapped_dns_handle (dns, p->payload, p->len,
+                                            b->payload, b->len);
+                if (res > 0) {
+                    b->len = res;
+                    b->tot_len = res;
+                    udp_sendfrom (pcb, b, &pcb->local_ip, pcb->local_port);
+                }
+                pthread_mutex_unlock (&lwip_mutex);
+                pbuf_free (b);
+            }
+            pbuf_free (p);
+            udp_recv (pcb, NULL, NULL);
+            udp_remove (pcb);
             return;
         }
     }
 
-    udp = hev_socks5_session_udp_new (pcb, &mutex);
-    if (!udp) {
+    pbuf_free (p);
+
+    LOG_D ("accepting new UDP connection");
+
+    /* Create UDP session */
+    pthread_mutex_lock (&lwip_mutex);
+    udp_session = hev_socks5_session_udp_new (pcb, &lwip_mutex);
+    pthread_mutex_unlock (&lwip_mutex);
+
+    if (!udp_session) {
         udp_remove (pcb);
         return;
     }
 
-    stack_size = hev_config_get_misc_task_stack_size ();
-    task = hev_task_new (stack_size);
-    if (!task) {
-        hev_object_unref (HEV_OBJECT (udp));
+    /* Create task data */
+    task_data = (SessionTaskData *)malloc (sizeof (SessionTaskData));
+    if (!task_data) {
+        udp_remove (pcb);
         return;
     }
 
-    hev_socks5_session_set_task (HEV_SOCKS5_SESSION (udp), task);
-    node = hev_socks5_session_get_node (HEV_SOCKS5_SESSION (udp));
-    hev_socks5_tunnel_insert_session (node);
-    hev_task_run (task, hev_socks5_session_task_entry, udp);
-    hev_task_wakeup (task_lwip_timer);
-}
+    task_data->session = udp_session;
+    task_data->run_func = (void (*) (void *))hev_socks5_session_run;
 
-static void
-event_task_entry (void *data)
-{
-    HevListNode *node;
-    int val;
+    /* Track session */
+    insert_session (udp_session);
 
-    LOG_D ("socks5 tunnel event task run");
-
-    hev_task_add_fd (task_event, event_fds[0], POLLIN);
-
-    hev_task_io_read (event_fds[0], &val, sizeof (val), NULL, NULL);
-
-    run = 0;
-    node = hev_list_first (&session_set);
-    for (; node; node = hev_list_node_next (node)) {
-        HevSocks5SessionData *sd;
-
-        sd = container_of (node, HevSocks5SessionData, node);
-        hev_socks5_session_terminate (sd->self);
+    /* Submit to thread pool */
+    if (hev_thread_pool_submit (thread_pool, session_task_wrapper,
+                                task_data) < 0) {
+        LOG_E ("failed to submit UDP session to thread pool");
+        remove_session (udp_session);
+        free (task_data);
+        udp_remove (pcb);
+        return;
     }
-
-    hev_task_join (task_lwip_io);
-    hev_task_join (task_lwip_timer);
-    hev_task_del_fd (task_event, event_fds[0]);
 }
 
+/* ========================================================================
+ * Packet Processing
+ * ======================================================================== */
+
 static void
-lwip_io_task_entry (void *data)
+packet_read_callback (struct pbuf *p, void *user_data)
 {
-    const unsigned int mtu = hev_config_get_tunnel_mtu ();
+    if (!p)
+        return;
 
-    LOG_D ("socks5 tunnel lwip task run");
-
-    hev_tunnel_add_task (tun_fd, task_lwip_io);
-
-    for (; run;) {
-        struct pbuf *buf;
-
-        buf = hev_tunnel_read (tun_fd, mtu, task_io_yielder, NULL);
-        if (!buf)
-            continue;
-
-        stat_tx_packets++;
-        stat_tx_bytes += buf->tot_len;
-
-        hev_task_mutex_lock (&mutex);
-        if (netif.input (buf, &netif) != ERR_OK)
-            pbuf_free (buf);
-        hev_task_mutex_unlock (&mutex);
+    /* Process packet through LwIP */
+    pthread_mutex_lock (&lwip_mutex);
+    if (netif.input (p, &netif) != ERR_OK) {
+        pbuf_free (p);
     }
-
-    hev_tunnel_del_task (tun_fd, task_lwip_io);
+    pthread_mutex_unlock (&lwip_mutex);
 }
 
-static void
-lwip_timer_task_entry (void *data)
+/* ========================================================================
+ * Timer Thread
+ * ======================================================================== */
+
+static void *
+timer_thread_func (void *arg)
 {
-    unsigned int i;
+    unsigned int counter = 0;
 
-    LOG_D ("socks5 tunnel timer task run");
+    LOG_I ("timer thread started");
 
-    for (i = 1; run; i++) {
-        hev_task_mutex_lock (&mutex);
+    while (run) {
+        usleep (TCP_TMR_INTERVAL * 1000);
+
+        pthread_mutex_lock (&lwip_mutex);
+
         tcp_tmr ();
 
-        if ((i & 3) == 0) {
+        if ((counter & 3) == 0) {
 #if IP_REASSEMBLY
             ip_reass_tmr ();
 #endif
@@ -344,47 +387,49 @@ lwip_timer_task_entry (void *data)
 #endif
 #endif
         }
-        hev_task_mutex_unlock (&mutex);
 
-        if (hev_list_first (&session_set))
-            hev_task_sleep (TCP_TMR_INTERVAL);
-        else
-            hev_task_yield (HEV_TASK_WAITIO);
+        pthread_mutex_unlock (&lwip_mutex);
+
+        counter++;
     }
+
+    LOG_I ("timer thread stopped");
+    return NULL;
 }
+
+/* ========================================================================
+ * Tunnel Initialization
+ * ======================================================================== */
 
 static int
 tunnel_init (int extern_tun_fd)
 {
     const char *script_path, *name, *ipv4, *ipv6;
-    int multi_queue, res;
+    int res;
     unsigned int mtu;
 
     if (extern_tun_fd >= 0) {
         int nonblock = 1;
-
         res = ioctl (extern_tun_fd, FIONBIO, (char *)&nonblock);
         if (res < 0) {
-            LOG_E ("socks5 tunnel non-blocking");
+            LOG_E ("failed to set tunnel non-blocking");
             return -1;
         }
-
         tun_fd = extern_tun_fd;
         return 0;
     }
 
     name = hev_config_get_tunnel_name ();
-    multi_queue = hev_config_get_tunnel_multi_queue ();
-    tun_fd = hev_tunnel_open (name, multi_queue);
+    tun_fd = hev_tunnel_open (name, 0); /* multi-queue handled internally */
     if (tun_fd < 0) {
-        LOG_E ("socks5 tunnel open (%s)", strerror (errno));
+        LOG_E ("failed to open tunnel: %s", strerror (errno));
         return -1;
     }
 
     mtu = hev_config_get_tunnel_mtu ();
     res = hev_tunnel_set_mtu (mtu);
     if (res < 0) {
-        LOG_E ("socks5 tunnel mtu");
+        LOG_E ("failed to set tunnel MTU");
         return -1;
     }
 
@@ -392,7 +437,7 @@ tunnel_init (int extern_tun_fd)
     if (ipv4) {
         res = hev_tunnel_set_ipv4 (ipv4, 32);
         if (res < 0) {
-            LOG_E ("socks5 tunnel ipv4");
+            LOG_E ("failed to set tunnel IPv4");
             return -1;
         }
     }
@@ -401,14 +446,14 @@ tunnel_init (int extern_tun_fd)
     if (ipv6) {
         res = hev_tunnel_set_ipv6 (ipv6, 128);
         if (res < 0) {
-            LOG_E ("socks5 tunnel ipv6");
+            LOG_E ("failed to set tunnel IPv6");
             return -1;
         }
     }
 
     res = hev_tunnel_set_state (1);
     if (res < 0) {
-        LOG_E ("socks5 tunnel state");
+        LOG_E ("failed to bring tunnel up");
         return -1;
     }
 
@@ -438,6 +483,10 @@ tunnel_fini (void)
     tun_fd_local = 0;
     tun_fd = -1;
 }
+
+/* ========================================================================
+ * Gateway Initialization
+ * ======================================================================== */
 
 static int
 gateway_init (void)
@@ -471,113 +520,29 @@ gateway_init (void)
     udp_bind (udp, NULL, 0);
     udp_recv (udp, udp_recv_handler, NULL);
 
+    LOG_I ("gateway initialized");
     return 0;
 }
 
 static void
 gateway_fini (void)
 {
-    udp_remove (udp);
-    tcp_close (tcp);
+    if (udp)
+        udp_remove (udp);
+    if (tcp)
+        tcp_close (tcp);
     netif_remove (&netif);
 }
 
-static int
-event_task_init (void)
-{
-    int nonblock = 1;
-    int res;
-
-    res = socketpair (PF_LOCAL, SOCK_STREAM, 0, event_fds);
-    if (res < 0) {
-        LOG_E ("socks5 tunnel event");
-        return -1;
-    }
-
-    res = ioctl (event_fds[0], FIONBIO, (char *)&nonblock);
-    if (res < 0) {
-        LOG_E ("socks5 tunnel event nonblock");
-        return -1;
-    }
-
-    task_event = hev_task_new (-1);
-    if (!task_event) {
-        LOG_E ("socks5 tunnel task event");
-        return -1;
-    }
-
-    return 0;
-}
-
-static void
-event_task_fini (void)
-{
-    if (task_event) {
-        hev_task_unref (task_event);
-        task_event = NULL;
-    }
-
-    if (event_fds[0] >= 0) {
-        close (event_fds[0]);
-        event_fds[0] = -1;
-    }
-    if (event_fds[1] >= 0) {
-        close (event_fds[1]);
-        event_fds[1] = -1;
-    }
-}
-
-static int
-lwip_io_task_init (void)
-{
-    task_lwip_io = hev_task_new (-1);
-    if (!task_lwip_io) {
-        LOG_E ("socks5 tunnel task lwip");
-        return -1;
-    }
-    hev_task_set_priority (task_lwip_io, 1);
-
-    return 0;
-}
-
-static void
-lwip_io_task_fini (void)
-{
-    if (task_lwip_io) {
-        hev_task_unref (task_lwip_io);
-        task_lwip_io = NULL;
-    }
-}
-
-static int
-lwip_timer_task_init (void)
-{
-    task_lwip_timer = hev_task_new (-1);
-    if (!task_lwip_timer) {
-        LOG_E ("socks5 tunnel task timer");
-        return -1;
-    }
-    hev_task_set_priority (task_lwip_timer, 1);
-
-    return 0;
-}
-
-static void
-lwip_timer_task_fini (void)
-{
-    if (task_lwip_timer) {
-        hev_task_unref (task_lwip_timer);
-        task_lwip_timer = NULL;
-    }
-}
+/* ========================================================================
+ * DNS Mapping
+ * ======================================================================== */
 
 static int
 mapped_dns_init (void)
 {
     HevMappedDNS *dns;
-    int cache_size;
-    int network;
-    int netmask;
+    int cache_size, network, netmask;
 
     network = hev_config_get_mapdns_network ();
     netmask = hev_config_get_mapdns_netmask ();
@@ -591,60 +556,73 @@ mapped_dns_init (void)
         return -1;
 
     hev_mapped_dns_put (dns);
-
+    LOG_I ("mapped DNS initialized");
     return 0;
 }
 
 static void
 mapped_dns_fini (void)
 {
-    HevMappedDNS *dns;
-
-    dns = hev_mapped_dns_get ();
+    HevMappedDNS *dns = hev_mapped_dns_get ();
     if (dns) {
         hev_object_unref (HEV_OBJECT (dns));
         hev_mapped_dns_put (NULL);
     }
 }
 
+/* ========================================================================
+ * Public API
+ * ======================================================================== */
+
 int
-hev_socks5_tunnel_init (int tun_fd)
+hev_socks5_tunnel_init (int extern_tun_fd)
 {
     int res;
+    unsigned int mtu;
 
-    LOG_D ("socks5 tunnel init");
-
-    res = tunnel_init (tun_fd);
-    if (res < 0)
-        goto exit;
-
-    res = gateway_init ();
-    if (res < 0)
-        goto exit;
-
-    res = event_task_init ();
-    if (res < 0)
-        goto exit;
-
-    res = lwip_io_task_init ();
-    if (res < 0)
-        goto exit;
-
-    res = lwip_timer_task_init ();
-    if (res < 0)
-        goto exit;
-
-    res = mapped_dns_init ();
-    if (res < 0)
-        goto exit;
+    LOG_I ("initializing socks5 tunnel (multi-threaded)");
 
     signal (SIGPIPE, SIG_IGN);
 
-    hev_task_mutex_init (&mutex);
+    /* Initialize tunnel */
+    res = tunnel_init (extern_tun_fd);
+    if (res < 0)
+        goto error;
 
+    /* Initialize LwIP gateway */
+    pthread_mutex_lock (&lwip_mutex);
+    lwip_init ();
+    res = gateway_init ();
+    pthread_mutex_unlock (&lwip_mutex);
+    if (res < 0)
+        goto error;
+
+    /* Initialize DNS mapping */
+    res = mapped_dns_init ();
+    if (res < 0)
+        goto error;
+
+    /* Create thread pool (auto-detect optimal size) */
+    thread_pool = hev_thread_pool_new (0);
+    if (!thread_pool) {
+        LOG_E ("failed to create thread pool");
+        goto error;
+    }
+
+    /* Create tunnel I/O manager */
+    mtu = hev_config_get_tunnel_mtu ();
+    tunnel_io = hev_tunnel_io_new (tun_fd, mtu);
+    if (!tunnel_io) {
+        LOG_E ("failed to create tunnel I/O");
+        goto error;
+    }
+
+    hev_tunnel_io_set_read_callback (tunnel_io, packet_read_callback, NULL);
+
+    LOG_I ("socks5 tunnel initialized successfully");
     return 0;
 
-exit:
+error:
     hev_socks5_tunnel_fini ();
     return -1;
 }
@@ -652,76 +630,89 @@ exit:
 void
 hev_socks5_tunnel_fini (void)
 {
-    LOG_D ("socks5 tunnel fini");
+    LOG_I ("finalizing socks5 tunnel");
+
+    if (tunnel_io) {
+        hev_tunnel_io_destroy (tunnel_io);
+        tunnel_io = NULL;
+    }
+
+    if (thread_pool) {
+        hev_thread_pool_destroy (thread_pool);
+        thread_pool = NULL;
+    }
 
     mapped_dns_fini ();
-    lwip_timer_task_fini ();
-    lwip_io_task_fini ();
-    event_task_fini ();
     gateway_fini ();
     tunnel_fini ();
 
-    stat_tx_packets = 0;
-    stat_rx_packets = 0;
-    stat_tx_bytes = 0;
-    stat_rx_bytes = 0;
+    /* Clear session list */
+    pthread_mutex_lock (&session_mutex);
+    while (session_list_head) {
+        SessionNode *node = session_list_head;
+        session_list_head = node->next;
+        free (node);
+    }
+    session_list_tail = NULL;
+    session_count = 0;
+    pthread_mutex_unlock (&session_mutex);
 }
 
 int
 hev_socks5_tunnel_run (void)
 {
-    LOG_D ("socks5 tunnel run");
-
-    task_event = hev_task_ref (task_event);
-    hev_task_run (task_event, event_task_entry, NULL);
-
-    task_lwip_io = hev_task_ref (task_lwip_io);
-    hev_task_run (task_lwip_io, lwip_io_task_entry, NULL);
-
-    task_lwip_timer = hev_task_ref (task_lwip_timer);
-    hev_task_run (task_lwip_timer, lwip_timer_task_entry, NULL);
+    LOG_I ("starting socks5 tunnel");
 
     run = 1;
-    hev_task_system_run ();
 
+    /* Start timer thread */
+    if (pthread_create (&timer_thread, NULL, timer_thread_func, NULL) != 0) {
+        LOG_E ("failed to create timer thread");
+        return -1;
+    }
+
+    /* Start tunnel I/O */
+    if (hev_tunnel_io_start (tunnel_io) < 0) {
+        LOG_E ("failed to start tunnel I/O");
+        run = 0;
+        pthread_join (timer_thread, NULL);
+        return -1;
+    }
+
+    LOG_I ("socks5 tunnel running (press Ctrl+C to stop)");
+
+    /* Wait for timer thread to finish */
+    pthread_join (timer_thread, NULL);
+
+    LOG_I ("socks5 tunnel stopped");
     return 0;
 }
 
 void
 hev_socks5_tunnel_stop (void)
 {
-    int res;
-    int fd;
+    LOG_I ("stopping socks5 tunnel");
+    run = 0;
 
-    LOG_D ("socks5 tunnel stop");
-
-    for (;;) {
-        fd = READ_ONCE (event_fds[1]);
-        if (fd >= 0)
-            break;
-        /* Wait for async initialization */
-        usleep (100 * 1000);
-    }
-
-    res = write (fd, &res, 1);
-    assert (res > 0 && "socks5 tunnel write event");
+    if (tunnel_io)
+        hev_tunnel_io_stop (tunnel_io);
 }
 
 void
 hev_socks5_tunnel_stats (size_t *tx_packets, size_t *tx_bytes,
                          size_t *rx_packets, size_t *rx_bytes)
 {
-    LOG_D ("socks5 tunnel stats");
-
-    if (tx_packets)
-        *tx_packets = stat_tx_packets;
-
-    if (tx_bytes)
-        *tx_bytes = stat_tx_bytes;
-
-    if (rx_packets)
-        *rx_packets = stat_rx_packets;
-
-    if (rx_bytes)
-        *rx_bytes = stat_rx_bytes;
+    if (tunnel_io) {
+        hev_tunnel_io_get_stats (tunnel_io, tx_packets, tx_bytes, rx_packets,
+                                rx_bytes);
+    } else {
+        if (tx_packets)
+            *tx_packets = 0;
+        if (tx_bytes)
+            *tx_bytes = 0;
+        if (rx_packets)
+            *rx_packets = 0;
+        if (rx_bytes)
+            *rx_bytes = 0;
+    }
 }

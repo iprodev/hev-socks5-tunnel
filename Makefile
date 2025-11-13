@@ -14,11 +14,9 @@ CCFLAGS=-O3 -pipe -Wall -Werror $(CFLAGS) \
 		-I$(THIRDPARTDIR)/yaml/include \
 		-I$(THIRDPARTDIR)/wintun/include \
 		-I$(THIRDPARTDIR)/lwip/src/include \
-		-I$(THIRDPARTDIR)/lwip/src/ports/include \
-		-I$(THIRDPARTDIR)/hev-task-system/include
+		-I$(THIRDPARTDIR)/lwip/src/ports/include
 LDFLAGS=-L$(THIRDPARTDIR)/yaml/bin -lyaml \
 		-L$(THIRDPARTDIR)/lwip/bin -llwip \
-		-L$(THIRDPARTDIR)/hev-task-system/bin -lhev-task-system \
 		-lpthread $(LFLAGS)
 
 SRCDIR=src
@@ -33,8 +31,7 @@ EXEC_TARGET=$(BINDIR)/hev-socks5-tunnel
 STATIC_TARGET=$(BINDIR)/lib$(PROJECT).a
 SHARED_TARGET=$(BINDIR)/lib$(PROJECT).so
 THIRDPARTS=$(THIRDPARTDIR)/yaml \
-		   $(THIRDPARTDIR)/lwip \
-		   $(THIRDPARTDIR)/hev-task-system
+		   $(THIRDPARTDIR)/lwip
 
 $(STATIC_TARGET) : CCFLAGS+=-DENABLE_LIBRARY
 $(SHARED_TARGET) : CCFLAGS+=-DENABLE_LIBRARY -fPIC

@@ -1,0 +1,46 @@
+# Multi-threaded configuration for hev-socks5-tunnel
+
+tunnel:
+  name: tun0
+  mtu: 8500
+  multi-queue: false
+  ipv4: 198.18.0.1
+  ipv6: 'fc00::1'
+
+socks5:
+  port: 1080
+  address: 127.0.0.1
+  udp: 'udp'
+
+# NEW: Multi-threading configuration
+threading:
+  # Number of worker threads (0 = auto-detect CPU cores)
+  num-workers: 0
+  
+  # Enable CPU affinity (bind threads to specific cores)
+  enable-cpu-affinity: true
+  
+  # Enable dynamic load balancing
+  enable-load-balancing: true
+  
+  # Maximum sessions per worker thread (0 = unlimited)
+  max-sessions-per-thread: 1000
+  
+  # Work queue size per worker
+  work-queue-size: 1000
+
+misc:
+  # Reduced per-session resources since we have multiple threads
+  task-stack-size: 65536
+  tcp-buffer-size: 32768
+  udp-recv-buffer-size: 262144
+  
+  # Global session limit (distributed across all threads)
+  max-session-count: 0
+  
+  connect-timeout: 10000
+  tcp-read-write-timeout: 300000
+  udp-read-write-timeout: 60000
+  
+  log-file: stderr
+  log-level: info
